@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-CLI interface for the Polymarket News Pipeline.
+Polymarket Pipeline — CLI Interface
 
 Usage:
+    python cli.py verify               # Check all API keys and connections
     python cli.py run                  # Run full pipeline (dry-run by default)
     python cli.py run --live           # Run with live trading enabled
     python cli.py run --max 5          # Scan max 5 markets
     python cli.py run --hours 12       # Look back 12 hours for news
-    python cli.py dashboard            # Launch live terminal dashboard (demo mode)
-    python cli.py dashboard --speed 5  # Faster scan cycles (5s)
-    python cli.py scrape               # Test scraper only
-    python cli.py markets              # View available markets
-    python cli.py trades               # View recent trade log
-    python cli.py stats                # View trade statistics
+    python cli.py dashboard            # Launch live terminal dashboard
+    python cli.py dashboard --speed 30 # Faster scan cycles (30s)
+    python cli.py scrape               # Test news scraper only
+    python cli.py markets              # Browse active Polymarket markets
+    python cli.py trades               # View trade log
+    python cli.py stats                # Performance statistics
 """
 
 import argparse
@@ -129,6 +130,114 @@ def cmd_dashboard(args):
     run_dashboard(scan_interval=args.speed)
 
 
+def cmd_verify(args):
+    """Check all API keys and connections work."""
+    from rich.panel import Panel
+
+    console.print(Panel("[bold]POLYMARKET PIPELINE — VERIFICATION[/bold]", style="bright_green"))
+    all_good = True
+
+    # 1. Python version
+    import sys
+    v = sys.version_info
+    py_ok = v.major == 3 and v.minor >= 9
+    status = "[bright_green]PASS[/bright_green]" if py_ok else "[red]FAIL[/red]"
+    console.print(f"  {status}  Python {v.major}.{v.minor}.{v.micro}")
+    if not py_ok:
+        all_good = False
+
+    # 2. Dependencies
+    deps_ok = True
+    for mod in ["anthropic", "feedparser", "httpx", "rich", "dotenv"]:
+        try:
+            __import__(mod)
+        except ImportError:
+            console.print(f"  [red]FAIL[/red]  Missing module: {mod}")
+            deps_ok = False
+            all_good = False
+    if deps_ok:
+        console.print(f"  [bright_green]PASS[/bright_green]  All dependencies installed")
+
+    # 3. .env exists
+    import os
+    env_exists = os.path.exists(os.path.join(os.path.dirname(__file__), ".env"))
+    status = "[bright_green]PASS[/bright_green]" if env_exists else "[red]FAIL[/red] — run: cp .env.example .env"
+    console.print(f"  {status}  .env file")
+    if not env_exists:
+        all_good = False
+
+    # 4. Anthropic API key
+    import config
+    has_key = bool(config.ANTHROPIC_API_KEY) and config.ANTHROPIC_API_KEY != "sk-ant-..."
+    if has_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "Say OK"}],
+            )
+            console.print(f"  [bright_green]PASS[/bright_green]  Anthropic API key (verified)")
+        except Exception as e:
+            console.print(f"  [red]FAIL[/red]  Anthropic API key — {type(e).__name__}: {e}")
+            all_good = False
+    else:
+        console.print(f"  [red]FAIL[/red]  Anthropic API key not set")
+        all_good = False
+
+    # 5. News scraper
+    console.print(f"  [dim]...testing news scraper[/dim]", end="\r")
+    try:
+        from scraper import scrape_rss
+        items = scrape_rss(config.RSS_FEEDS[0], 12)
+        console.print(f"  [bright_green]PASS[/bright_green]  News scraper ({len(items)} headlines from RSS)")
+    except Exception as e:
+        console.print(f"  [yellow]WARN[/yellow]  News scraper — {e}")
+
+    # 6. Polymarket API
+    console.print(f"  [dim]...testing Polymarket API[/dim]", end="\r")
+    try:
+        from markets import fetch_active_markets
+        markets = fetch_active_markets(limit=5)
+        console.print(f"  [bright_green]PASS[/bright_green]  Polymarket API ({len(markets)} markets fetched)")
+    except Exception as e:
+        console.print(f"  [yellow]WARN[/yellow]  Polymarket API — {e}")
+
+    # 7. Polymarket trading credentials (optional)
+    has_poly = bool(config.POLYMARKET_API_KEY)
+    if has_poly:
+        console.print(f"  [bright_green]PASS[/bright_green]  Polymarket trading credentials set")
+    else:
+        console.print(f"  [dim]SKIP[/dim]  Polymarket trading credentials (optional — needed for --live)")
+
+    # 8. SQLite
+    try:
+        import logger as _
+        console.print(f"  [bright_green]PASS[/bright_green]  SQLite database")
+    except Exception as e:
+        console.print(f"  [red]FAIL[/red]  SQLite — {e}")
+        all_good = False
+
+    # Summary
+    console.print()
+    if all_good:
+        console.print(Panel(
+            "[bright_green bold]ALL CHECKS PASSED[/bright_green bold]\n\n"
+            "You're ready to go. Run:\n"
+            "  python cli.py run              # Dry-run pipeline\n"
+            "  python cli.py dashboard        # Live terminal dashboard\n"
+            "  python cli.py run --live       # Real trading (careful!)",
+            style="bright_green",
+        ))
+    else:
+        console.print(Panel(
+            "[yellow bold]SOME CHECKS FAILED[/yellow bold]\n\n"
+            "Fix the issues above, then run: python cli.py verify",
+            style="yellow",
+        ))
+
+
 def cmd_stats(args):
     import logger
 
@@ -157,8 +266,12 @@ def main():
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Launch live terminal dashboard")
-    p_dash.add_argument("--speed", type=float, default=8.0, help="Seconds between scan cycles")
+    p_dash.add_argument("--speed", type=float, default=60.0, help="Seconds between scan cycles")
     p_dash.set_defaults(func=cmd_dashboard)
+
+    # verify
+    p_verify = sub.add_parser("verify", help="Check API keys and connections")
+    p_verify.set_defaults(func=cmd_verify)
 
     # scrape
     p_scrape = sub.add_parser("scrape", help="Test the news scraper")
