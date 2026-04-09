@@ -86,7 +86,7 @@ def cmd_sports_backtest(args):
 def cmd_kaggle_backtest(args):
     """Run backtest using the Kaggle Polymarket dataset (real price history)."""
     from kaggle_backtest import run_kaggle_backtest
-    run_kaggle_backtest(zip_path=args.zip, max_markets=args.markets)
+    run_kaggle_backtest(zip_path=args.zip, max_markets=args.markets, starting_bankroll=args.bankroll)
 
 
 def cmd_calibrate(args):
@@ -436,6 +436,7 @@ def main():
     p_kbt = sub.add_parser("kaggle-backtest", help="Kaggle backtest: real price history from dataset")
     p_kbt.add_argument("--zip", type=str, required=True, help="Path to Kaggle archive.zip")
     p_kbt.add_argument("--markets", type=int, default=100, help="Max sports markets to process")
+    p_kbt.add_argument("--bankroll", type=float, default=30.0, help="Starting bankroll in USD (default $30)")
     p_kbt.set_defaults(func=cmd_kaggle_backtest)
 
     # calibrate

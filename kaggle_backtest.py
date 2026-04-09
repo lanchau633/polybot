@@ -78,6 +78,7 @@ class KaggleBacktestResult:
     won: bool
     stop_loss_triggered: bool
     hold_hours: float
+    bankroll_after: float = 0.0   # bankroll after this trade settled
 
 
 @dataclass
@@ -91,6 +92,10 @@ class KaggleBacktestReport:
     avg_edge: float
     roi: float
     stop_losses_triggered: int
+    starting_bankroll: float = 30.0
+    ending_bankroll: float = 0.0
+    peak_bankroll: float = 0.0
+    max_drawdown: float = 0.0
     results: list[KaggleBacktestResult] = field(default_factory=list)
 
 
@@ -215,10 +220,24 @@ def _extract_market_ids_from_zip(z: zipfile.ZipFile) -> list[tuple[str, str]]:
 
 # ── Core simulation ───────────────────────────────────────────────────────────
 
+def _size_bet(edge: float, bankroll: float) -> float:
+    """
+    Quarter-Kelly position sizing against a real bankroll.
+    Respects MIN_BANKROLL_RESERVE (keep 10% cash) and MAX_BET_USD cap.
+    """
+    fraction = edge * config.KELLY_FRACTION  # 0.25
+    raw_size = bankroll * fraction
+    # Enforce 10% cash reserve
+    max_from_bankroll = bankroll * (1.0 - config.MIN_BANKROLL_RESERVE)
+    capped = min(raw_size, max_from_bankroll, config.MAX_BET_USD)
+    return max(round(capped, 2), 0.50)  # $0.50 minimum bet
+
+
 def _simulate_trade(
     question: str,
     yes_series: list[PricePoint],
     resolved_price: float,
+    bankroll: float = 30.0,
 ) -> KaggleBacktestResult | None:
     """
     Simulate the edge_detector + stop_loss_monitor strategy on a single market.
@@ -226,6 +245,7 @@ def _simulate_trade(
     Strategy:
       - At each price point, compute simulated sportsbook prob vs Polymarket price
       - Enter when gap >= EDGE_THRESHOLD (first occurrence)
+      - Bet sized via quarter-Kelly against current bankroll
       - Hold until resolution OR stop-loss fires (15% drop below entry)
       - P&L based on entry price and final exit price
     """
@@ -253,7 +273,13 @@ def _simulate_trade(
 
     entry_price = entry_point.price if side == "YES" else (1.0 - entry_point.price)
     edge = abs(sportsbook_prob - entry_point.price)
-    bet_amount = size_position(edge)
+    bet_amount = _size_bet(edge, bankroll)
+
+    # Can't bet more than we have (minus reserve)
+    if bet_amount > bankroll * 0.90:
+        bet_amount = round(bankroll * 0.90, 2)
+    if bet_amount < 0.50 or bankroll < 1.00:
+        return None  # bankroll too low to trade
 
     # Simulate hold period: check for stop-loss
     stop_loss_triggered = False
@@ -325,19 +351,22 @@ def _simulate_trade(
 def run_kaggle_backtest(
     zip_path: str,
     max_markets: int = 100,
+    starting_bankroll: float = 30.0,
 ) -> KaggleBacktestReport:
     """
     Run the full backtest against the Kaggle dataset.
 
     Args:
-        zip_path:    Path to archive.zip
-        max_markets: Max sports markets to process (Gamma API rate limiting)
+        zip_path:          Path to archive.zip
+        max_markets:       Max sports markets to process (Gamma API rate limiting)
+        starting_bankroll: Starting bankroll in USD (default $30)
     """
     console.print(Panel(
         f"[bold bright_green]PolyBot Kaggle Backtest[/bold bright_green]\n"
         f"  Dataset: {Path(zip_path).name}\n"
-        f"  Max markets: {max_markets} | Edge threshold: {config.EDGE_THRESHOLD:.0%} | "
-        f"Stop-loss: {config.STOP_LOSS_THRESHOLD:.0%}",
+        f"  Starting bankroll: [bold]${starting_bankroll:.2f}[/bold]\n"
+        f"  Max markets: {max_markets} | Edge: {config.EDGE_THRESHOLD:.0%} | "
+        f"Stop-loss: {config.STOP_LOSS_THRESHOLD:.0%} | Kelly: {config.KELLY_FRACTION}x",
         style="bright_green",
     ))
 
@@ -387,14 +416,30 @@ def run_kaggle_backtest(
         console.print("[yellow]No sports markets found. The dataset may not contain sports content.[/yellow]")
         return KaggleBacktestReport("", scanned, 0, 0, 0.0, 0.0, 0.0, 0.0, 0)
 
-    # Step 3: Load price data and simulate
-    console.print(f"\n[bold]Step 3/4: Loading price history and simulating trades...[/bold]\n")
+    # Step 3: Load price data and simulate sequentially with real bankroll
+    console.print(f"\n[bold]Step 3/4: Simulating trades (bankroll=${starting_bankroll:.2f})...[/bold]\n")
     results: list[KaggleBacktestResult] = []
+    bankroll = starting_bankroll
+    peak_bankroll = starting_bankroll
+    max_drawdown = 0.0
+    consecutive_losses = 0
+    circuit_breaker_trips = 0
 
     for i, mkt in enumerate(sports_markets):
         cid = mkt["condition_id"]
         question = mkt["question"]
-        console.print(f"  [{i+1:>3}/{len(sports_markets)}] {question[:60]}", end="\r")
+        console.print(f"  [{i+1:>3}/{len(sports_markets)}] ${bankroll:>7.2f} | {question[:50]}", end="\r")
+
+        # Circuit breaker: halt after 5 consecutive losses
+        if consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
+            consecutive_losses = 0
+            circuit_breaker_trips += 1
+            continue
+
+        # Skip if bankroll too low
+        if bankroll < 1.00:
+            console.print(f"\n  [red bold]BANKROLL DEPLETED at trade #{i+1} (${bankroll:.2f})[/red bold]")
+            break
 
         series = _load_price_series(z, cid)
         if not series or 0 not in series:
@@ -408,17 +453,32 @@ def run_kaggle_backtest(
         if resolved_price is None:
             continue  # skip unresolved / still open markets
 
-        result = _simulate_trade(question, yes_series, resolved_price)
+        result = _simulate_trade(question, yes_series, resolved_price, bankroll=bankroll)
         if result:
             result.condition_id = cid
+            # Update bankroll
+            bankroll += result.pnl
+            result.bankroll_after = round(bankroll, 2)
             results.append(result)
+
+            # Track peak and drawdown
+            if bankroll > peak_bankroll:
+                peak_bankroll = bankroll
+            drawdown = (peak_bankroll - bankroll) / peak_bankroll if peak_bankroll > 0 else 0
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+            # Track consecutive losses for circuit breaker
+            if result.won:
+                consecutive_losses = 0
+            else:
+                consecutive_losses += 1
 
     console.print()  # clear \r line
 
     # Step 4: Build and print report
     console.print(f"[bold]Step 4/4: Building report...[/bold]")
 
-    triggered = [r for r in results if True]  # all results had signals
     wins = [r for r in results if r.won]
     stop_losses = [r for r in results if r.stop_loss_triggered]
     total_pnl = sum(r.pnl for r in results)
@@ -426,12 +486,7 @@ def run_kaggle_backtest(
     win_rate = (len(wins) / len(results) * 100) if results else 0.0
     avg_edge = (sum(r.edge_at_entry for r in results) / len(results) * 100) if results else 0.0
     roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0.0
-
-    # Dataset date range
-    all_timestamps: list[int] = []
-    for r in results:
-        pass  # timestamps are already converted to strings in results
-    date_range = "Jul 20 – Aug 20, 2025"
+    date_range = "Jul 20 - Aug 20, 2025"
 
     report = KaggleBacktestReport(
         dataset_period=date_range,
@@ -443,6 +498,10 @@ def run_kaggle_backtest(
         avg_edge=round(avg_edge, 1),
         roi=round(roi, 1),
         stop_losses_triggered=len(stop_losses),
+        starting_bankroll=starting_bankroll,
+        ending_bankroll=round(bankroll, 2),
+        peak_bankroll=round(peak_bankroll, 2),
+        max_drawdown=round(max_drawdown * 100, 1),
         results=results,
     )
 
@@ -455,9 +514,21 @@ def run_kaggle_backtest(
 def _print_report(report: KaggleBacktestReport) -> None:
     console.print()
 
+    # Bankroll headline
+    gain = report.ending_bankroll - report.starting_bankroll
+    gain_pct = (gain / report.starting_bankroll * 100) if report.starting_bankroll > 0 else 0
+    gain_color = "bright_green" if gain >= 0 else "red"
+    console.print(Panel(
+        f"  ${report.starting_bankroll:.2f}  -->  "
+        f"[{gain_color} bold]${report.ending_bankroll:.2f}[/{gain_color} bold]  "
+        f"([{gain_color}]{'+' if gain >= 0 else ''}{gain_pct:.1f}%[/{gain_color}])",
+        title="Bankroll",
+        style=gain_color,
+    ))
+
     # Summary table
     summary = Table(
-        title=f"Kaggle Backtest — {report.dataset_period}",
+        title=f"Kaggle Backtest - {report.dataset_period}",
         show_header=True,
         header_style="bold cyan",
     )
@@ -465,6 +536,12 @@ def _print_report(report: KaggleBacktestReport) -> None:
     summary.add_column("Value", justify="right")
 
     summary.add_row("Dataset period", report.dataset_period)
+    summary.add_row("Starting bankroll", f"${report.starting_bankroll:.2f}")
+    summary.add_row("Ending bankroll", f"[{gain_color}]${report.ending_bankroll:.2f}[/{gain_color}]")
+    summary.add_row("Peak bankroll", f"${report.peak_bankroll:.2f}")
+    dd_color = "bright_green" if report.max_drawdown < 20 else ("yellow" if report.max_drawdown < 40 else "red")
+    summary.add_row("Max drawdown", f"[{dd_color}]{report.max_drawdown:.1f}%[/{dd_color}]")
+    summary.add_row("", "")
     summary.add_row("Markets scanned (Gamma)", str(report.markets_scanned))
     summary.add_row("Sports markets found", str(report.sports_markets))
     summary.add_row("Signals triggered", str(report.signals_triggered))
@@ -507,19 +584,18 @@ def _print_report(report: KaggleBacktestReport) -> None:
         show_header=True,
         header_style="bold green",
     )
-    trades_table.add_column("Market", max_width=35)
+    trades_table.add_column("Market", max_width=30)
     trades_table.add_column("Sport", width=8)
-    trades_table.add_column("Entry", width=11)
     trades_table.add_column("Entry $", justify="right", width=7)
-    trades_table.add_column("SB prob", justify="right", width=7)
     trades_table.add_column("Edge", justify="right", width=6)
     trades_table.add_column("Side", width=4)
     trades_table.add_column("Bet", justify="right", width=7)
     trades_table.add_column("P&L", justify="right", width=9)
-    trades_table.add_column("Exit", width=8)
+    trades_table.add_column("Bankroll", justify="right", width=9)
+    trades_table.add_column("Exit", width=6)
 
-    sorted_results = sorted(report.results, key=lambda r: abs(r.pnl), reverse=True)
-    for r in sorted_results[:25]:
+    # Show in chronological order (entry_time) to tell the bankroll story
+    for r in report.results[:30]:
         pnl_str = f"+${r.pnl:.2f}" if r.pnl >= 0 else f"-${abs(r.pnl):.2f}"
         pnl_color = "bright_green" if r.pnl >= 0 else "red"
 
@@ -530,16 +606,16 @@ def _print_report(report: KaggleBacktestReport) -> None:
         else:
             exit_str = "[red]LOSS[/red]"
 
+        br_color = "bright_green" if r.bankroll_after >= report.starting_bankroll else "red"
         trades_table.add_row(
-            r.question[:35],
+            r.question[:30],
             r.sport[:8],
-            r.entry_time[:11],
             f"{r.entry_price:.3f}",
-            f"{r.sportsbook_prob:.3f}",
             f"{r.edge_at_entry:.1%}",
             r.side,
             f"${r.bet_amount:.2f}",
             f"[{pnl_color}]{pnl_str}[/{pnl_color}]",
+            f"[{br_color}]${r.bankroll_after:.2f}[/{br_color}]",
             exit_str,
         )
 
@@ -559,9 +635,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PolyBot Kaggle Backtest")
     parser.add_argument("--zip", type=str, required=True, help="Path to archive.zip")
     parser.add_argument("--markets", type=int, default=100, help="Max sports markets to process")
+    parser.add_argument("--bankroll", type=float, default=30.0, help="Starting bankroll in USD (default $30)")
     args = parser.parse_args()
 
-    run_kaggle_backtest(zip_path=args.zip, max_markets=args.markets)
+    run_kaggle_backtest(zip_path=args.zip, max_markets=args.markets, starting_bankroll=args.bankroll)
 
 
 if __name__ == "__main__":
