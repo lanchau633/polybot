@@ -25,6 +25,7 @@ from news_stream import NewsAggregator, NewsEvent
 from market_watcher import MarketWatcher
 from matcher import match_news_to_markets
 from classifier import classify_async
+import sports_scanner
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ class PipelineV2:
                 self._process_news(),
                 self._execute_signals(),
                 self._status_printer(),
+                sports_scanner.run(),   # Phase 1: sports/general market scanner
                 return_exceptions=True,
             )
         except asyncio.CancelledError:
