@@ -29,6 +29,8 @@ import sports_scanner
 import edge_detector
 import risk_manager
 import notifier
+import stop_loss_monitor
+import daily_report
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -76,6 +78,8 @@ class PipelineV2:
                     sports_scanner.market_queue,
                     self.signal_queue,
                 ),
+                stop_loss_monitor.run(),  # Phase 3: stop-loss polling
+                daily_report.run(),       # Phase 3: midnight UTC P&L report
                 return_exceptions=True,
             )
         except asyncio.CancelledError:
@@ -146,6 +150,19 @@ class PipelineV2:
             self.stats["trades_executed"] += 1
             risk_manager.record_trade()
             risk_manager.open_position()
+
+            # Phase 3: register position for stop-loss monitoring
+            from markets import get_token_id
+            token_id = get_token_id(signal.market, signal.side)
+            if token_id:
+                entry = signal.market.yes_price if signal.side == "YES" else signal.market.no_price
+                stop_loss_monitor.track_position(
+                    market=signal.market,
+                    token_id=token_id,
+                    side=signal.side,
+                    size=signal.bet_amount,
+                    entry_price=entry,
+                )
 
             # Phase 2: Discord trade notification
             await notifier.notify_trade(
