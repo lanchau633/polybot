@@ -8,7 +8,8 @@ Usage:
     python cli.py run                  # V1: Synchronous pipeline (RSS → score → trade)
     python cli.py run --live           # V1: With live trading
     python cli.py dashboard            # Launch live terminal dashboard
-    python cli.py backtest             # Backtest V2 strategy against resolved markets
+    python cli.py backtest             # Backtest V2 news strategy against resolved markets
+    python cli.py sports-backtest      # Sports backtest: sportsbook odds vs Polymarket
     python cli.py calibrate            # Show classification accuracy report
     python cli.py niche                # Browse niche markets (< $500K volume)
     python cli.py verify               # Check all API keys and connections
@@ -68,6 +69,17 @@ def cmd_backtest(args):
     """Run backtest against resolved markets."""
     from backtest import run_backtest
     run_backtest(limit=args.limit, category=args.category)
+
+
+def cmd_sports_backtest(args):
+    """Run sports-specific backtest using sportsbook odds vs Polymarket prices."""
+    import asyncio
+    from sports_backtest import run_sports_backtest
+    asyncio.run(run_sports_backtest(
+        limit=args.limit,
+        sport_filter=args.sport,
+        use_api=not args.no_api,
+    ))
 
 
 def cmd_calibrate(args):
@@ -400,11 +412,18 @@ def main():
     p_dash.add_argument("--speed", type=float, default=60.0, help="Seconds between scan cycles")
     p_dash.set_defaults(func=cmd_dashboard)
 
-    # backtest
-    p_bt = sub.add_parser("backtest", help="Backtest V2 strategy")
+    # backtest (original news-based)
+    p_bt = sub.add_parser("backtest", help="Backtest V2 news strategy")
     p_bt.add_argument("--limit", type=int, default=30, help="Number of resolved markets")
     p_bt.add_argument("--category", type=str, default=None, help="Filter by category")
     p_bt.set_defaults(func=cmd_backtest)
+
+    # sports-backtest (sportsbook odds vs Polymarket)
+    p_sbt = sub.add_parser("sports-backtest", help="Sports backtest: sportsbook odds vs Polymarket prices")
+    p_sbt.add_argument("--limit", type=int, default=50, help="Number of resolved markets")
+    p_sbt.add_argument("--sport", type=str, default=None, help="Filter by sport (e.g. soccer, nba)")
+    p_sbt.add_argument("--no-api", action="store_true", help="Skip API-Sports, use simulation only")
+    p_sbt.set_defaults(func=cmd_sports_backtest)
 
     # calibrate
     p_cal = sub.add_parser("calibrate", help="Show classification accuracy report")
