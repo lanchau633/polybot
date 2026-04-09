@@ -10,6 +10,7 @@ Usage:
     python cli.py dashboard            # Launch live terminal dashboard
     python cli.py backtest             # Backtest V2 news strategy against resolved markets
     python cli.py sports-backtest      # Sports backtest: sportsbook odds vs Polymarket
+    python cli.py kaggle-backtest      # Kaggle backtest: real price history from dataset
     python cli.py calibrate            # Show classification accuracy report
     python cli.py niche                # Browse niche markets (< $500K volume)
     python cli.py verify               # Check all API keys and connections
@@ -80,6 +81,12 @@ def cmd_sports_backtest(args):
         sport_filter=args.sport,
         use_api=not args.no_api,
     ))
+
+
+def cmd_kaggle_backtest(args):
+    """Run backtest using the Kaggle Polymarket dataset (real price history)."""
+    from kaggle_backtest import run_kaggle_backtest
+    run_kaggle_backtest(zip_path=args.zip, max_markets=args.markets)
 
 
 def cmd_calibrate(args):
@@ -424,6 +431,12 @@ def main():
     p_sbt.add_argument("--sport", type=str, default=None, help="Filter by sport (e.g. soccer, nba)")
     p_sbt.add_argument("--no-api", action="store_true", help="Skip API-Sports, use simulation only")
     p_sbt.set_defaults(func=cmd_sports_backtest)
+
+    # kaggle-backtest (real Polymarket price history from Kaggle dataset)
+    p_kbt = sub.add_parser("kaggle-backtest", help="Kaggle backtest: real price history from dataset")
+    p_kbt.add_argument("--zip", type=str, required=True, help="Path to Kaggle archive.zip")
+    p_kbt.add_argument("--markets", type=int, default=100, help="Max sports markets to process")
+    p_kbt.set_defaults(func=cmd_kaggle_backtest)
 
     # calibrate
     p_cal = sub.add_parser("calibrate", help="Show classification accuracy report")
