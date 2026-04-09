@@ -65,6 +65,60 @@ def _execute_live(signal: Signal) -> dict:
         return _log_and_return(signal, status=f"error_{type(e).__name__}", order_id=None)
 
 
+def sell_position(market, token_id: str, size: float, price: float) -> dict:
+    """Place a SELL order for an open position. Respects DRY_RUN."""
+    result = {
+        "market": market.question,
+        "side": "SELL",
+        "amount": size,
+        "token_id": token_id,
+        "price": price,
+        "status": "dry_run",
+        "order_id": None,
+    }
+
+    if config.DRY_RUN:
+        result["status"] = "dry_run"
+        return result
+
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        client = ClobClient(
+            host=config.POLYMARKET_HOST,
+            key=config.POLYMARKET_API_KEY,
+            chain_id=137,
+            funder=config.POLYMARKET_PRIVATE_KEY,
+        )
+        client.set_api_creds(client.create_or_derive_api_creds())
+
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side="SELL",
+            token_id=token_id,
+        )
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+
+        result["order_id"] = resp.get("orderID", resp.get("id", "unknown"))
+        result["status"] = "executed"
+    except ImportError:
+        result["status"] = "error_no_clob_client"
+    except Exception as e:
+        result["status"] = f"error_{type(e).__name__}"
+
+    return result
+
+
+async def sell_position_async(market, token_id: str, size: float, price: float) -> dict:
+    """Async wrapper around sell_position."""
+    return await asyncio.get_event_loop().run_in_executor(
+        None, sell_position, market, token_id, size, price
+    )
+
+
 def _log_and_return(signal: Signal, status: str, order_id: str | None) -> dict:
     """Log trade to SQLite and return result dict."""
     trade_id = logger.log_trade(

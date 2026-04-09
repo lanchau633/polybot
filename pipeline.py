@@ -26,6 +26,9 @@ from market_watcher import MarketWatcher
 from matcher import match_news_to_markets
 from classifier import classify_async
 import sports_scanner
+import edge_detector
+import risk_manager
+import notifier
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -69,6 +72,10 @@ class PipelineV2:
                 self._execute_signals(),
                 self._status_printer(),
                 sports_scanner.run(),   # Phase 1: sports/general market scanner
+                edge_detector.run(      # Phase 2: sportsbook odds comparison
+                    sports_scanner.market_queue,
+                    self.signal_queue,
+                ),
                 return_exceptions=True,
             )
         except asyncio.CancelledError:
@@ -122,11 +129,31 @@ class PipelineV2:
                     log.warning(f"[pipeline] Classification error: {e}")
 
     async def _execute_signals(self):
-        """Execute trades from the signal queue."""
+        """Execute trades from the signal queue (with risk manager gate)."""
         while True:
             signal: Signal = await self.signal_queue.get()
+
+            # Phase 2: risk manager gatekeeper
+            allowed, reason = risk_manager.can_trade(
+                bet_amount=signal.bet_amount,
+            )
+            if not allowed:
+                log.warning("Trade blocked by risk_manager: %s", reason)
+                console.print(f"  [red]BLOCKED[/red] {reason} — {signal.market.question[:40]}")
+                continue
+
             result = await execute_trade_async(signal)
             self.stats["trades_executed"] += 1
+            risk_manager.record_trade()
+            risk_manager.open_position()
+
+            # Phase 2: Discord trade notification
+            await notifier.notify_trade(
+                market=result["market"],
+                side=result["side"],
+                amount=result["amount"],
+                edge=result["edge"],
+            )
 
             status_color = "bright_green" if result["status"] in ("dry_run", "executed") else "red"
             console.print(

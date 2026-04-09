@@ -37,8 +37,8 @@ Load only when needed:
 
 ## Current State
 **Last Updated:** 2026-04-08
-**Working On:** Nothing yet — workspace setup complete, ready to start Phase 1
-**Recently Completed:** PRD + Tech Design docs, AGENTS.md workspace setup
+**Working On:** Phase 3 — Stop-Loss + Daily Report
+**Recently Completed:** Phase 1 (sports_scanner + notifier) + Phase 2 (edge_detector + risk_manager + sell_position)
 **Blocked By:** None
 
 ## Roadmap
