@@ -1,0 +1,32 @@
+[Unit]
+Description=PolyBot — Automated Polymarket Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+ExecStart=/opt/polybot/venv/bin/python run.py
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Environment
+EnvironmentFile=/opt/polybot/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polybot
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polybot
+
+[Install]
+WantedBy=multi-user.target
