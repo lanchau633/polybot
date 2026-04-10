@@ -222,10 +222,10 @@ def _extract_market_ids_from_zip(z: zipfile.ZipFile) -> list[tuple[str, str]]:
 
 def _size_bet(edge: float, bankroll: float) -> float:
     """
-    Quarter-Kelly position sizing against a real bankroll.
+    Kelly position sizing against a real bankroll (fraction set by KELLY_FRACTION).
     Respects MIN_BANKROLL_RESERVE (keep 10% cash) and MAX_BET_USD cap.
     """
-    fraction = edge * config.KELLY_FRACTION  # 0.25
+    fraction = edge * config.KELLY_FRACTION
     raw_size = bankroll * fraction
     # Enforce 10% cash reserve
     max_from_bankroll = bankroll * (1.0 - config.MIN_BANKROLL_RESERVE)
@@ -272,6 +272,8 @@ def _simulate_trade(
         return None  # no edge found
 
     entry_price = entry_point.price if side == "YES" else (1.0 - entry_point.price)
+    if entry_price <= 0:
+        return None  # can't trade at zero price (division by zero in P&L calc)
     edge = abs(sportsbook_prob - entry_point.price)
     bet_amount = _size_bet(edge, bankroll)
 
@@ -370,143 +372,149 @@ def run_kaggle_backtest(
         style="bright_green",
     ))
 
+    if not Path(zip_path).exists():
+        console.print(f"[red bold]Error: file not found: {zip_path}[/red bold]")
+        return KaggleBacktestReport("", 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0)
+
     z = zipfile.ZipFile(zip_path)
+    try:
+        # Step 1: Extract market IDs from dataset
+        console.print("\n[bold]Step 1/4: Extracting market IDs from dataset...[/bold]")
+        market_pairs = _extract_market_ids_from_zip(z)
+        console.print(f"  Found [bold]{len(market_pairs)}[/bold] unique markets in dataset")
 
-    # Step 1: Extract market IDs from dataset
-    console.print("\n[bold]Step 1/4: Extracting market IDs from dataset...[/bold]")
-    market_pairs = _extract_market_ids_from_zip(z)
-    console.print(f"  Found [bold]{len(market_pairs)}[/bold] unique markets in dataset")
+        # Step 2: Query Gamma API to find sports markets
+        console.print(f"\n[bold]Step 2/4: Identifying sports markets via Gamma API...[/bold]")
+        console.print(f"  (Scanning up to {min(len(market_pairs), max_markets * 4)} markets to find {max_markets} sports)")
 
-    # Step 2: Query Gamma API to find sports markets
-    console.print(f"\n[bold]Step 2/4: Identifying sports markets via Gamma API...[/bold]")
-    console.print(f"  (Scanning up to {min(len(market_pairs), max_markets * 4)} markets to find {max_markets} sports)")
+        sports_markets = []
+        scanned = 0
+        scan_limit = min(len(market_pairs), max_markets * 4)
 
-    sports_markets = []
-    scanned = 0
-    scan_limit = min(len(market_pairs), max_markets * 4)
+        for cid, mid in market_pairs[:scan_limit]:
+            info = _fetch_market_info(mid)
+            scanned += 1
+            if info:
+                question = info.get("question", "")
+                tags = info.get("tags", []) or []
+                category = _classify_market(question, tags)
+                q_lower = question.lower()
+                is_sports = category == "sports" or any(kw in q_lower for kw in SPORTS_KEYWORDS)
 
-    for cid, mid in market_pairs[:scan_limit]:
-        info = _fetch_market_info(mid)
-        scanned += 1
-        if info:
-            question = info.get("question", "")
-            tags = info.get("tags", []) or []
-            category = _classify_market(question, tags)
-            q_lower = question.lower()
-            is_sports = category == "sports" or any(kw in q_lower for kw in SPORTS_KEYWORDS)
+                if is_sports and question:
+                    sports_markets.append({
+                        "condition_id": cid,
+                        "market_id": mid,
+                        "question": question,
+                        "closed": info.get("closed", False),
+                    })
+                    console.print(f"  [{len(sports_markets):>3}] {question[:65]}")
+                    if len(sports_markets) >= max_markets:
+                        break
 
-            if is_sports and question:
-                sports_markets.append({
-                    "condition_id": cid,
-                    "market_id": mid,
-                    "question": question,
-                    "closed": info.get("closed", False),
-                })
-                console.print(f"  [{len(sports_markets):>3}] {question[:65]}")
-                if len(sports_markets) >= max_markets:
-                    break
+            if scanned % 20 == 0:
+                console.print(f"  ... scanned {scanned} / {scan_limit}, found {len(sports_markets)} sports so far")
+            time.sleep(0.15)
 
-        if scanned % 20 == 0:
-            console.print(f"  ... scanned {scanned} / {scan_limit}, found {len(sports_markets)} sports so far")
-        time.sleep(0.15)
+        console.print(f"\n  Found [bold]{len(sports_markets)}[/bold] sports markets")
 
-    console.print(f"\n  Found [bold]{len(sports_markets)}[/bold] sports markets")
+        if not sports_markets:
+            console.print("[yellow]No sports markets found. The dataset may not contain sports content.[/yellow]")
+            return KaggleBacktestReport("", scanned, 0, 0, 0.0, 0.0, 0.0, 0.0, 0)
 
-    if not sports_markets:
-        console.print("[yellow]No sports markets found. The dataset may not contain sports content.[/yellow]")
-        return KaggleBacktestReport("", scanned, 0, 0, 0.0, 0.0, 0.0, 0.0, 0)
+        # Step 3: Load price data and simulate sequentially with real bankroll
+        console.print(f"\n[bold]Step 3/4: Simulating trades (bankroll=${starting_bankroll:.2f})...[/bold]\n")
+        results: list[KaggleBacktestResult] = []
+        bankroll = starting_bankroll
+        peak_bankroll = starting_bankroll
+        max_drawdown = 0.0
+        consecutive_losses = 0
+        circuit_breaker_trips = 0
 
-    # Step 3: Load price data and simulate sequentially with real bankroll
-    console.print(f"\n[bold]Step 3/4: Simulating trades (bankroll=${starting_bankroll:.2f})...[/bold]\n")
-    results: list[KaggleBacktestResult] = []
-    bankroll = starting_bankroll
-    peak_bankroll = starting_bankroll
-    max_drawdown = 0.0
-    consecutive_losses = 0
-    circuit_breaker_trips = 0
+        for i, mkt in enumerate(sports_markets):
+            cid = mkt["condition_id"]
+            question = mkt["question"]
+            console.print(f"  [{i+1:>3}/{len(sports_markets)}] ${bankroll:>7.2f} | {question[:50]}", end="\r")
 
-    for i, mkt in enumerate(sports_markets):
-        cid = mkt["condition_id"]
-        question = mkt["question"]
-        console.print(f"  [{i+1:>3}/{len(sports_markets)}] ${bankroll:>7.2f} | {question[:50]}", end="\r")
-
-        # Circuit breaker: halt after 5 consecutive losses
-        if consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
-            consecutive_losses = 0
-            circuit_breaker_trips += 1
-            continue
-
-        # Skip if bankroll too low
-        if bankroll < 1.00:
-            console.print(f"\n  [red bold]BANKROLL DEPLETED at trade #{i+1} (${bankroll:.2f})[/red bold]")
-            break
-
-        series = _load_price_series(z, cid)
-        if not series or 0 not in series:
-            continue
-
-        yes_series = series[0]
-        if len(yes_series) < 3:
-            continue
-
-        resolved_price = _get_final_resolution(series)
-        if resolved_price is None:
-            continue  # skip unresolved / still open markets
-
-        result = _simulate_trade(question, yes_series, resolved_price, bankroll=bankroll)
-        if result:
-            result.condition_id = cid
-            # Update bankroll
-            bankroll += result.pnl
-            result.bankroll_after = round(bankroll, 2)
-            results.append(result)
-
-            # Track peak and drawdown
-            if bankroll > peak_bankroll:
-                peak_bankroll = bankroll
-            drawdown = (peak_bankroll - bankroll) / peak_bankroll if peak_bankroll > 0 else 0
-            if drawdown > max_drawdown:
-                max_drawdown = drawdown
-
-            # Track consecutive losses for circuit breaker
-            if result.won:
+            # Circuit breaker: halt after 5 consecutive losses
+            if consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
                 consecutive_losses = 0
-            else:
-                consecutive_losses += 1
+                circuit_breaker_trips += 1
+                continue
 
-    console.print()  # clear \r line
+            # Skip if bankroll too low
+            if bankroll < 1.00:
+                console.print(f"\n  [red bold]BANKROLL DEPLETED at trade #{i+1} (${bankroll:.2f})[/red bold]")
+                break
 
-    # Step 4: Build and print report
-    console.print(f"[bold]Step 4/4: Building report...[/bold]")
+            series = _load_price_series(z, cid)
+            if not series or 0 not in series:
+                continue
 
-    wins = [r for r in results if r.won]
-    stop_losses = [r for r in results if r.stop_loss_triggered]
-    total_pnl = sum(r.pnl for r in results)
-    total_wagered = sum(r.bet_amount for r in results)
-    win_rate = (len(wins) / len(results) * 100) if results else 0.0
-    avg_edge = (sum(r.edge_at_entry for r in results) / len(results) * 100) if results else 0.0
-    roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0.0
-    date_range = "Jul 20 - Aug 20, 2025"
+            yes_series = series[0]
+            if len(yes_series) < 3:
+                continue
 
-    report = KaggleBacktestReport(
-        dataset_period=date_range,
-        markets_scanned=scanned,
-        sports_markets=len(sports_markets),
-        signals_triggered=len(results),
-        total_pnl=round(total_pnl, 2),
-        win_rate=round(win_rate, 1),
-        avg_edge=round(avg_edge, 1),
-        roi=round(roi, 1),
-        stop_losses_triggered=len(stop_losses),
-        starting_bankroll=starting_bankroll,
-        ending_bankroll=round(bankroll, 2),
-        peak_bankroll=round(peak_bankroll, 2),
-        max_drawdown=round(max_drawdown * 100, 1),
-        results=results,
-    )
+            resolved_price = _get_final_resolution(series)
+            if resolved_price is None:
+                continue  # skip unresolved / still open markets
 
-    _print_report(report)
-    return report
+            result = _simulate_trade(question, yes_series, resolved_price, bankroll=bankroll)
+            if result:
+                result.condition_id = cid
+                # Update bankroll
+                bankroll += result.pnl
+                result.bankroll_after = round(bankroll, 2)
+                results.append(result)
+
+                # Track peak and drawdown
+                if bankroll > peak_bankroll:
+                    peak_bankroll = bankroll
+                drawdown = (peak_bankroll - bankroll) / peak_bankroll if peak_bankroll > 0 else 0
+                if drawdown > max_drawdown:
+                    max_drawdown = drawdown
+
+                # Track consecutive losses for circuit breaker
+                if result.won:
+                    consecutive_losses = 0
+                else:
+                    consecutive_losses += 1
+
+        console.print()  # clear \r line
+
+        # Step 4: Build and print report
+        console.print(f"[bold]Step 4/4: Building report...[/bold]")
+
+        wins = [r for r in results if r.won]
+        stop_losses = [r for r in results if r.stop_loss_triggered]
+        total_pnl = sum(r.pnl for r in results)
+        total_wagered = sum(r.bet_amount for r in results)
+        win_rate = (len(wins) / len(results) * 100) if results else 0.0
+        avg_edge = (sum(r.edge_at_entry for r in results) / len(results) * 100) if results else 0.0
+        roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0.0
+        date_range = "Jul 20 - Aug 20, 2025"
+
+        report = KaggleBacktestReport(
+            dataset_period=date_range,
+            markets_scanned=scanned,
+            sports_markets=len(sports_markets),
+            signals_triggered=len(results),
+            total_pnl=round(total_pnl, 2),
+            win_rate=round(win_rate, 1),
+            avg_edge=round(avg_edge, 1),
+            roi=round(roi, 1),
+            stop_losses_triggered=len(stop_losses),
+            starting_bankroll=starting_bankroll,
+            ending_bankroll=round(bankroll, 2),
+            peak_bankroll=round(peak_bankroll, 2),
+            max_drawdown=round(max_drawdown * 100, 1),
+            results=results,
+        )
+
+        _print_report(report)
+        return report
+    finally:
+        z.close()
 
 
 # ── Rich output ───────────────────────────────────────────────────────────────
@@ -580,7 +588,7 @@ def _print_report(report: KaggleBacktestReport) -> None:
         return
 
     trades_table = Table(
-        title=f"Simulated Trades (showing {min(25, len(report.results))} of {len(report.results)})",
+        title=f"Simulated Trades (showing {min(30, len(report.results))} of {len(report.results)})",
         show_header=True,
         header_style="bold green",
     )

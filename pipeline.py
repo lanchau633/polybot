@@ -140,6 +140,7 @@ class PipelineV2:
             # Phase 2: risk manager gatekeeper
             allowed, reason = risk_manager.can_trade(
                 bet_amount=signal.bet_amount,
+                bankroll=self.stats.get("bankroll", 0.0),
             )
             if not allowed:
                 log.warning("Trade blocked by risk_manager: %s", reason)
@@ -147,30 +148,36 @@ class PipelineV2:
                 continue
 
             result = await execute_trade_async(signal)
-            self.stats["trades_executed"] += 1
-            risk_manager.record_trade()
-            risk_manager.open_position()
 
-            # Phase 3: register position for stop-loss monitoring
-            from markets import get_token_id
-            token_id = get_token_id(signal.market, signal.side)
-            if token_id:
-                entry = signal.market.yes_price if signal.side == "YES" else signal.market.no_price
-                stop_loss_monitor.track_position(
-                    market=signal.market,
-                    token_id=token_id,
-                    side=signal.side,
-                    size=signal.bet_amount,
-                    entry_price=entry,
+            # Only record trade/position if execution actually succeeded
+            if result["status"] in ("dry_run", "executed"):
+                self.stats["trades_executed"] += 1
+                risk_manager.record_trade()
+                risk_manager.open_position()
+
+                # Phase 3: register position for stop-loss monitoring
+                from markets import get_token_id
+                token_id = get_token_id(signal.market, signal.side)
+                if token_id:
+                    entry = signal.market.yes_price if signal.side == "YES" else signal.market.no_price
+                    stop_loss_monitor.track_position(
+                        market=signal.market,
+                        token_id=token_id,
+                        side=signal.side,
+                        size=signal.bet_amount,
+                        entry_price=entry,
+                    )
+
+                # Phase 2: Discord trade notification
+                await notifier.notify_trade(
+                    market=result["market"],
+                    side=result["side"],
+                    amount=result["amount"],
+                    edge=result["edge"],
                 )
-
-            # Phase 2: Discord trade notification
-            await notifier.notify_trade(
-                market=result["market"],
-                side=result["side"],
-                amount=result["amount"],
-                edge=result["edge"],
-            )
+            else:
+                log.warning("Trade failed (%s), not recording: %s",
+                            result["status"], signal.market.question[:40])
 
             status_color = "bright_green" if result["status"] in ("dry_run", "executed") else "red"
             console.print(

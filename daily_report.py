@@ -36,13 +36,13 @@ def build_daily_summary() -> dict:
     today_trades = [t for t in trades if t.get("created_at", "").startswith(today)]
 
     total = len(today_trades)
-    executed = [t for t in today_trades if t["status"] in ("dry_run", "executed")]
+    executed = [t for t in today_trades if t.get("status") in ("dry_run", "executed")]
 
     # Estimate P&L from trade amounts (actual P&L requires resolution data)
     total_spent = sum(t.get("amount_usd", 0) for t in executed)
 
     # Count wins/losses from outcomes table if available
-    wins = sum(1 for t in today_trades if t["status"] == "executed")
+    wins = sum(1 for t in today_trades if t.get("status") == "executed")
     losses = sum(1 for t in today_trades if "error" in t.get("status", ""))
 
     return {

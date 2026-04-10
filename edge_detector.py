@@ -159,7 +159,7 @@ async def fetch_sportsbook_odds(market: Market) -> float | None:
 
             return None
 
-    except (aiohttp.ClientError, ValueError, KeyError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as e:
         logger.error("API-Sports fetch failed: %s", e)
         return None
 

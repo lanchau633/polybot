@@ -7,6 +7,24 @@ import logger
 from edge import Signal
 from markets import get_token_id
 
+# Cached CLOB client (initialized once on first live trade)
+_clob_client = None
+
+
+def _get_clob_client():
+    """Get or create the cached CLOB client."""
+    global _clob_client
+    if _clob_client is None:
+        from py_clob_client.client import ClobClient
+        _clob_client = ClobClient(
+            host=config.POLYMARKET_HOST,
+            key=config.POLYMARKET_API_KEY,
+            chain_id=137,
+            funder=config.POLYMARKET_PRIVATE_KEY,
+        )
+        _clob_client.set_api_creds(_clob_client.create_or_derive_api_creds())
+    return _clob_client
+
 
 def execute_trade(signal: Signal) -> dict:
     """Execute a trade on Polymarket or log a dry-run. Synchronous."""
@@ -22,23 +40,15 @@ def execute_trade(signal: Signal) -> dict:
 
 async def execute_trade_async(signal: Signal) -> dict:
     """Async wrapper around execute_trade."""
-    return await asyncio.get_event_loop().run_in_executor(None, execute_trade, signal)
+    return await asyncio.get_running_loop().run_in_executor(None, execute_trade, signal)
 
 
 def _execute_live(signal: Signal) -> dict:
     """Place a real order via Polymarket CLOB client."""
     try:
-        from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType
 
-        client = ClobClient(
-            host=config.POLYMARKET_HOST,
-            key=config.POLYMARKET_API_KEY,
-            chain_id=137,
-            funder=config.POLYMARKET_PRIVATE_KEY,
-        )
-
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client = _get_clob_client()
 
         token_id = get_token_id(signal.market, signal.side)
         if not token_id:
@@ -82,16 +92,9 @@ def sell_position(market, token_id: str, size: float, price: float) -> dict:
         return result
 
     try:
-        from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType
 
-        client = ClobClient(
-            host=config.POLYMARKET_HOST,
-            key=config.POLYMARKET_API_KEY,
-            chain_id=137,
-            funder=config.POLYMARKET_PRIVATE_KEY,
-        )
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client = _get_clob_client()
 
         order_args = OrderArgs(
             price=price,
@@ -114,7 +117,7 @@ def sell_position(market, token_id: str, size: float, price: float) -> dict:
 
 async def sell_position_async(market, token_id: str, size: float, price: float) -> dict:
     """Async wrapper around sell_position."""
-    return await asyncio.get_event_loop().run_in_executor(
+    return await asyncio.get_running_loop().run_in_executor(
         None, sell_position, market, token_id, size, price
     )
 

@@ -82,7 +82,7 @@ async def _fetch_current_price(condition_id: str) -> float | None:
                     if len(prices) >= 2:
                         return float(prices[0])  # YES price
                 return None
-    except (aiohttp.ClientError, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
         logger.debug("Price fetch failed for %s: %s", condition_id, e)
         return None
 
@@ -129,17 +129,20 @@ async def _check_position(key: str, pos: TrackedPosition) -> None:
     )
     logger.info("Stop-loss sell result: %s", result["status"])
 
-    # Notify + update risk manager
-    await notifier.notify_stop_loss(
-        market=pos.market.question,
-        entry_price=pos.entry_price,
-        current_price=current_price,
-    )
-    risk_manager.close_position()
-    await risk_manager.record_outcome(win=False)
-
-    # Remove from tracking
-    _positions.pop(key, None)
+    # Only untrack and record loss if the sell actually succeeded
+    if result["status"] in ("dry_run", "executed"):
+        await notifier.notify_stop_loss(
+            market=pos.market.question,
+            entry_price=pos.entry_price,
+            current_price=current_price,
+        )
+        risk_manager.close_position()
+        await risk_manager.record_outcome(win=False)
+        _positions.pop(key, None)
+    else:
+        # Sell failed — keep tracking so we retry next cycle
+        logger.error("Stop-loss sell FAILED (%s), position still tracked: %s",
+                      result["status"], pos.market.question[:40])
 
 
 async def run() -> None:

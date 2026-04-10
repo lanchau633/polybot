@@ -120,7 +120,7 @@ async def _fetch_markets() -> list[Market]:
             async with session.get(GAMMA_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 resp.raise_for_status()
                 data = await resp.json(content_type=None)
-    except aiohttp.ClientError as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.error("Gamma API fetch failed: %s", e)
         return []
 
